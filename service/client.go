@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/database64128/swgp-go/conn"
+	"github.com/database64128/swgp-go/gateway"
 	"github.com/database64128/swgp-go/packet"
 	"github.com/database64128/swgp-go/tslog"
 )
@@ -104,6 +105,12 @@ type client struct {
 	mwg                    sync.WaitGroup
 	table                  map[netip.AddrPort]*clientNatEntry
 	startFunc              func(context.Context) error
+
+	// Gateway detection
+	gwMu      sync.RWMutex
+	gwAddr    netip.Addr
+	gwIfindex uint32
+	gwValid   bool
 }
 
 // Client creates a swgp client service from the client config.
@@ -215,6 +222,63 @@ func (c *client) Start(ctx context.Context) (err error) {
 	return c.startFunc(ctx)
 }
 
+func (c *client) startGatewayDetection(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Initial detection
+	addr, idx, ok := gateway.DetectOutgoingIface()
+	if ok {
+		c.logger.Info("Initial gateway detection successful",
+			slog.String("address", addr.String()),
+			slog.Uint64("ifindex", uint64(idx)))
+	} else {
+		c.logger.Info("Initial gateway detection failed")
+	}
+
+	c.gwMu.Lock()
+	c.gwAddr = addr
+	c.gwIfindex = idx
+	c.gwValid = ok
+	c.gwMu.Unlock()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			addr, idx, ok := gateway.DetectOutgoingIface()
+			
+			// Only log if there's a change or if detection failed
+			c.gwMu.RLock()
+			changed := ok != c.gwValid || (ok && (addr != c.gwAddr || idx != c.gwIfindex))
+			c.gwMu.RUnlock()
+
+			if changed {
+				if ok {
+					c.logger.Info("Gateway updated",
+						slog.String("address", addr.String()),
+						slog.Uint64("ifindex", uint64(idx)))
+				} else {
+					c.logger.Warn("Lost gateway connection")
+				}
+			}
+
+			c.gwMu.Lock()
+			c.gwAddr = addr
+			c.gwIfindex = idx
+			c.gwValid = ok
+			c.gwMu.Unlock()
+		}
+	}
+}
+
+func (c *client) getGatewayInfo() (addr netip.Addr, ifindex uint32, ok bool) {
+	c.gwMu.RLock()
+	defer c.gwMu.RUnlock()
+	return c.gwAddr, c.gwIfindex, c.gwValid
+}
+
 func (c *client) startGeneric(ctx context.Context) error {
 	wgConn, wgConnInfo, err := c.wgConnListenConfig.ListenUDP(ctx, c.wgListenNetwork, c.wgListenAddress)
 	if err != nil {
@@ -235,6 +299,9 @@ func (c *client) startGeneric(ctx context.Context) error {
 		c.recvFromWgConnGeneric(ctx, wgConn, wgConnInfo)
 		c.mwg.Done()
 	}()
+
+	// Start gateway detection
+	go c.startGatewayDetection(ctx)
 
 	if c.logger.Enabled(slog.LevelInfo) {
 		fields := make([]slog.Attr, 0, 7)
@@ -644,13 +711,15 @@ func (c *client) relayWgToProxyGeneric(uplink clientNatUplinkGeneric) {
 				sendBuf := b[:sendBufSize]
 				b = b[sendBufSize:]
 
-				var cmsg []byte
-				if sendSegmentCount > 1 {
-					scm := conn.SocketControlMessage{
-						SegmentSize: sqp.segmentSize,
-					}
-					cmsg = scm.AppendTo(cmsgBuf)
+				scm := conn.SocketControlMessage{
+					SegmentSize: sqp.segmentSize,
 				}
+				addr, idx, ok := c.getGatewayInfo()
+				if ok {
+					scm.PktinfoAddr = addr
+					scm.PktinfoIfindex = idx
+				}
+				cmsg := scm.AppendTo(cmsgBuf)
 
 				n, _, err := uplink.proxyConn.WriteMsgUDPAddrPort(sendBuf, cmsg, uplink.proxyAddrPort)
 				if err != nil {
