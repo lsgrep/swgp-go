@@ -56,6 +56,21 @@ const (
 	alignedSizeofInet6Pktinfo = (unix.SizeofInet6Pktinfo + unix.SizeofPtr - 1) & ^(unix.SizeofPtr - 1)
 )
 
+// CreateOutboundControlMessage creates a control message for outbound packets using en0
+func CreateOutboundControlMessage() ([]byte, error) {
+	ifindex, addr, err := GetHardcodedEn0Info()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get en0 info: %w", err)
+	}
+
+	m := SocketControlMessage{
+		PktinfoAddr: addr,
+		PktinfoIfindex: ifindex,
+	}
+
+	return m.appendTo(make([]byte, 0, socketControlMessageBufferSize)), nil
+}
+
 func (m SocketControlMessage) appendTo(b []byte) []byte {
 	switch {
 	case m.PktinfoAddr.Is4():

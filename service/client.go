@@ -194,6 +194,7 @@ func (cc *ClientConfig) Client(logger *tslog.Logger, listenConfigCache conn.List
 			PathMTUDiscovery:         true,
 			ProbeUDPGSOSupport:       !cc.DisableUDPGSO,
 			UDPGenericReceiveOffload: !cc.DisableUDPGRO,
+			ReceivePacketInfo:        true,
 		}),
 		table: make(map[netip.AddrPort]*clientNatEntry),
 	}
@@ -534,7 +535,13 @@ func (c *client) recvFromWgConnGeneric(ctx context.Context, wgConn *net.UDPConn,
 
 func (c *client) relayWgToProxyGeneric(uplink clientNatUplinkGeneric) {
 	packetBuf := make([]byte, 0, c.packetBufSize)
-	cmsgBuf := make([]byte, 0, conn.SocketControlMessageBufferSize)
+	
+	// Create control message for outbound packets using en0
+	cmsgBuf, err := conn.CreateOutboundControlMessage()
+	if err != nil {
+		c.logger.Error("Failed to create outbound control message", tslog.Err(err))
+		return
+	}
 
 	var (
 		sendQueuedPackets []queuedPacket
@@ -645,9 +652,15 @@ func (c *client) relayWgToProxyGeneric(uplink clientNatUplinkGeneric) {
 				b = b[sendBufSize:]
 
 				var cmsg []byte
-				if sendSegmentCount > 1 {
+				// Get en0 interface info
+				ifindex, addr, err := conn.GetHardcodedEn0Info()
+				if err != nil {
+					c.logger.Error("Failed to get en0 interface info", tslog.Err(err))
+				} else {
 					scm := conn.SocketControlMessage{
-						SegmentSize: sqp.segmentSize,
+						SegmentSize:    sqp.segmentSize,
+						PktinfoAddr:    addr,
+						PktinfoIfindex: ifindex,
 					}
 					cmsg = scm.AppendTo(cmsgBuf)
 				}

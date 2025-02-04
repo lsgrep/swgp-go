@@ -1,3 +1,12 @@
+# Binaries for programs and plugins
+**/swgp-go
+**/swgp-go.exe
+
+# Package directories
 /package-*/
-/swgp-go
-/swgp-go.exe
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
