@@ -645,12 +645,26 @@ func (c *client) relayWgToProxyGeneric(uplink clientNatUplinkGeneric) {
 				b = b[sendBufSize:]
 
 				var cmsg []byte
+				scm := conn.SocketControlMessage{}
 				if sendSegmentCount > 1 {
-					scm := conn.SocketControlMessage{
-						SegmentSize: sqp.segmentSize,
-					}
-					cmsg = scm.AppendTo(cmsgBuf)
+					scm.SegmentSize = sqp.segmentSize
 				}
+				routingCmsg := GetSourceRoutingControlMessage(uplink.proxyAddrPort.Addr().AsSlice())
+				if routingCmsg != nil && len(routingCmsg) > 0 {
+					routeInfo, err := conn.ParseSocketControlMessage(routingCmsg)
+					if err == nil {
+						scm.PktinfoAddr = routeInfo.PktinfoAddr
+						scm.PktinfoIfindex = routeInfo.PktinfoIfindex
+						
+						// Log the use of source routing
+						c.logger.Debug("Using source routing control message",
+							slog.String("client", c.name),
+							slog.String("sourceIP", routeInfo.PktinfoAddr.String()),
+							slog.Uint32("ifindex", routeInfo.PktinfoIfindex),
+							tslog.AddrPort("proxyAddress", uplink.proxyAddrPort))
+					}
+				}
+				cmsg = scm.AppendTo(cmsgBuf)
 
 				n, _, err := uplink.proxyConn.WriteMsgUDPAddrPort(sendBuf, cmsg, uplink.proxyAddrPort)
 				if err != nil {
@@ -908,6 +922,25 @@ func (c *client) relayProxyToWgGeneric(downlink clientNatDownlinkGeneric) {
 				if sendSegmentCount > 1 {
 					sscm.SegmentSize = qp.segmentSize
 				}
+				
+				// Check if we need to add routing information
+				routingCmsg := GetSourceRoutingControlMessage(downlink.clientAddrPort.Addr().AsSlice())
+				if routingCmsg != nil && len(routingCmsg) > 0 {
+					routeInfo, err := conn.ParseSocketControlMessage(routingCmsg)
+					if err == nil {
+						// Override the packet info with the routing information
+						sscm.PktinfoAddr = routeInfo.PktinfoAddr
+						sscm.PktinfoIfindex = routeInfo.PktinfoIfindex
+						
+						// Log the use of source routing
+						c.logger.Debug("Using source routing control message for client",
+							slog.String("client", c.name),
+							slog.String("sourceIP", routeInfo.PktinfoAddr.String()),
+							slog.Uint32("ifindex", routeInfo.PktinfoIfindex),
+							tslog.AddrPort("clientAddress", downlink.clientAddrPort))
+					}
+				}
+				
 				cmsg := sscm.AppendTo(sendCmsgBuf)
 
 				n, _, err := downlink.wgConn.WriteMsgUDPAddrPort(sendBuf, cmsg, downlink.clientAddrPort)

@@ -89,5 +89,25 @@ func (m SocketControlMessage) appendTo(b []byte) []byte {
 		_ = copy(msgBuf[unix.SizeofCmsghdr:], unsafe.Slice((*byte)(unsafe.Pointer(&pktinfo)), unix.SizeofInet6Pktinfo))
 	}
 
+	// Add support for segment size if provided
+	// Darwin doesn't have native GSO/GRO support but we preserve the structure
+	// to maintain compatibility with the interface
+	if m.SegmentSize > 0 {
+		// Just add a dummy header to signal the existence of this option
+		// for cross-platform compatibility
+		const sizeofDummySegmentInfo = 4
+		var msgBuf []byte
+		b, msgBuf = slicehelper.Extend(b, unix.SizeofCmsghdr+sizeofDummySegmentInfo)
+		cmsghdr := (*unix.Cmsghdr)(unsafe.Pointer(unsafe.SliceData(msgBuf)))
+		*cmsghdr = unix.Cmsghdr{
+			Len:   unix.SizeofCmsghdr + sizeofDummySegmentInfo,
+			Level: unix.SOL_SOCKET,  // Use socket level
+			Type:  unix.SO_DEBUG,    // Use a generally harmless socket option as a placeholder
+		}
+		// Copy the segment size value even though it won't be used by Darwin
+		segmentSize := m.SegmentSize
+		_ = copy(msgBuf[unix.SizeofCmsghdr:], unsafe.Slice((*byte)(unsafe.Pointer(&segmentSize)), sizeofDummySegmentInfo))
+	}
+
 	return b
 }

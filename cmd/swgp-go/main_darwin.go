@@ -4,573 +4,196 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"github.com/database64128/swgp-go/service"
 	"github.com/database64128/swgp-go/tslog"
 	"log/slog"
 	"net"
-	"os"
-	"strings"
+	"net/netip"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/database64128/swgp-go/service"
-	"golang.org/x/net/route"
+	
+	"golang.org/x/sys/unix"
 )
 
-var (
-	ErrInvalidGateway       = errors.New("invalid gateway address")
-	rtmError          uint8 = 0x5 // RTM_ERROR, not exposed in syscall package
-)
-
-// GatewayMonitor handles gateway route monitoring and management
-type GatewayMonitor struct {
-	mu          sync.RWMutex
-	ip          net.IP
-	logger      *tslog.Logger
-	cfg         *service.Config
-	ctx         context.Context
-	cancel      context.CancelFunc
-	interval    time.Duration
-	routeSocket int
-	seq         int32
+// InterfaceConfig holds the network interface information for source routing
+type InterfaceConfig struct {
+	mu      sync.RWMutex
+	ifname  string
+	ifindex uint32
+	ipv4    netip.Addr
+	ipv6    netip.Addr
+	logger  *tslog.Logger
 }
 
-// NewGatewayMonitor creates a new gateway monitor instance
-func NewGatewayMonitor(cfg *service.Config, logger *tslog.Logger, interval time.Duration) (*GatewayMonitor, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Open routing socket
-	sock, err := syscall.Socket(syscall.AF_ROUTE, syscall.SOCK_RAW, syscall.AF_UNSPEC)
-	if err != nil {
-		cancel()
-		return nil, fmt.Errorf("open route socket: %w", err)
+// NewInterfaceConfig creates a new configuration for the specified interface
+func NewInterfaceConfig(ifname string, logger *tslog.Logger) (*InterfaceConfig, error) {
+	ic := &InterfaceConfig{
+		ifname: ifname,
+		logger: logger,
 	}
-
-	// Set socket options
-	err = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_USELOOPBACK, 1)
-	if err != nil {
-		syscall.Close(sock)
-		cancel()
-		return nil, fmt.Errorf("set socket options: %w", err)
-	}
-
-	// Discover initial gateway IP
-	monitor := &GatewayMonitor{
-		cfg:         cfg,
-		logger:      logger,
-		interval:    interval,
-		ctx:         ctx,
-		cancel:      cancel,
-		routeSocket: sock,
-		seq:         1,
-	}
-
-	initialIP, err := monitor.discoverGateway()
-	if err != nil {
-		cancel()
-		syscall.Close(sock)
-		return nil, fmt.Errorf("discover initial gateway: %w", err)
-	}
-	monitor.ip = initialIP
-
-	return monitor, nil
-}
-
-// getRouteTable returns the routing table messages using x/net/route package
-func (g *GatewayMonitor) getRouteTable() ([]*route.RouteMessage, error) {
-	rib, err := route.FetchRIB(syscall.AF_INET, syscall.NET_RT_DUMP, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch RIB: %v", err)
-	}
-
-	msgs, err := route.ParseRIB(syscall.NET_RT_DUMP, rib)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse RIB: %v", err)
-	}
-
-	var routeMsgs []*route.RouteMessage
-	for _, m := range msgs {
-		if rm, ok := m.(*route.RouteMessage); ok {
-			routeMsgs = append(routeMsgs, rm)
-		}
-	}
-	return routeMsgs, nil
-}
-
-func (g *GatewayMonitor) discoverGateway() (net.IP, error) {
-	msgs, err := g.getRouteTable()
-	if err != nil {
+	
+	if err := ic.updateInterfaceInfo(); err != nil {
 		return nil, err
 	}
-
-	var ips []net.IP
-	for _, rm := range msgs {
-		if rm.Flags&syscall.RTF_GATEWAY != 0 && rm.Flags&syscall.RTF_UP != 0 {
-			addr := rm.Addrs[syscall.RTAX_GATEWAY]
-			switch sa := addr.(type) {
-			case *route.Inet4Addr:
-				ip := net.IPv4(sa.IP[0], sa.IP[1], sa.IP[2], sa.IP[3])
-				if isValidGateway(ip, g.logger) {
-					ips = append(ips, ip)
-				}
-			case *route.Inet6Addr:
-				ip := make(net.IP, net.IPv6len)
-				copy(ip, sa.IP[:])
-				if isValidGateway(ip, g.logger) {
-					ips = append(ips, ip)
-				}
-			}
-		}
-	}
-	if len(ips) > 0 {
-		g.logger.Info("Found gateway", slog.String("ip", ips[0].String()))
-		return ips[0], nil
-	}
-	return nil, fmt.Errorf("no default gateway found")
+	
+	return ic, nil
 }
 
-func isValidGateway(ip net.IP, logger *tslog.Logger) bool {
-	if ip == nil || ip.Equal(net.IPv4zero) {
-		logger.Debug("Invalid gateway: nil or zero IP")
-		return false
+// updateInterfaceInfo gets the current IP and interface index for the specified interface
+func (ic *InterfaceConfig) updateInterfaceInfo() error {
+	iface, err := net.InterfaceByName(ic.ifname)
+	if err != nil {
+		return fmt.Errorf("getting interface %s: %w", ic.ifname, err)
 	}
-
-	// Check if it's a private network address (RFC 1918)
-	privateNetworks := []string{
-		"10.0.0.0/8",     // Class A
-		"172.16.0.0/12",  // Class B
-		"192.168.0.0/16", // Class C
-		"169.254.0.0/16", // Link-local
+	
+	ic.mu.Lock()
+	defer ic.mu.Unlock()
+	
+	ic.ifindex = uint32(iface.Index)
+	
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return fmt.Errorf("getting addresses for interface %s: %w", ic.ifname, err)
 	}
-
-	for _, network := range privateNetworks {
-		_, ipnet, err := net.ParseCIDR(network)
-		if err != nil {
-			logger.Error("Failed to parse CIDR", slog.String("network", network), tslog.Err(err))
+	
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
 			continue
 		}
-		if ipnet.Contains(ip) {
-			return true
-		}
-	}
-
-	logger.Debug("Invalid gateway: not in private or link-local range", slog.String("ip", ip.String()))
-	return false
-}
-
-func (g *GatewayMonitor) addRoute(dest net.IP, gateway net.IP, prefixLen int) error {
-	if gateway.Equal(net.IPv4zero) {
-		return fmt.Errorf("invalid gateway address: %v", gateway)
-	}
-
-	// Create routing message
-	rtmsg := &syscall.RtMsghdr{
-		Type:    syscall.RTM_ADD,
-		Version: syscall.RTM_VERSION,
-		Seq:     g.seq,
-		Addrs:   syscall.RTA_DST | syscall.RTA_GATEWAY | syscall.RTA_NETMASK,
-		Pid:     0, // Let kernel assign PID
-		Flags:   syscall.RTF_UP | syscall.RTF_GATEWAY | syscall.RTF_STATIC,
-	}
-	g.seq++
-
-	// Calculate total message size
-	msgLen := syscall.SizeofRtMsghdr + syscall.SizeofSockaddrInet4*3 // Header + Dest + Gateway + Netmask
-
-	// Create the message buffer
-	wb := make([]byte, msgLen)
-
-	// Copy header
-	rtmsg.Msglen = uint16(msgLen)
-	*(*syscall.RtMsghdr)(unsafe.Pointer(&wb[0])) = *rtmsg
-
-	// Add destination sockaddr
-	destAddr := syscall.RawSockaddrInet4{
-		Len:    syscall.SizeofSockaddrInet4,
-		Family: syscall.AF_INET,
-	}
-	copy(destAddr.Addr[:], dest.To4())
-	destPos := syscall.SizeofRtMsghdr
-	*(*syscall.RawSockaddrInet4)(unsafe.Pointer(&wb[destPos])) = destAddr
-
-	// Add gateway sockaddr
-	gwAddr := syscall.RawSockaddrInet4{
-		Len:    syscall.SizeofSockaddrInet4,
-		Family: syscall.AF_INET,
-	}
-	copy(gwAddr.Addr[:], gateway.To4())
-	gwPos := destPos + syscall.SizeofSockaddrInet4
-	*(*syscall.RawSockaddrInet4)(unsafe.Pointer(&wb[gwPos])) = gwAddr
-
-	// Add netmask sockaddr
-	maskAddr := syscall.RawSockaddrInet4{
-		Len:    syscall.SizeofSockaddrInet4,
-		Family: syscall.AF_INET,
-	}
-	// Create the netmask based on prefix length
-	if prefixLen > 32 {
-		prefixLen = 32
-	}
-	for i := 0; i < prefixLen/8; i++ {
-		maskAddr.Addr[i] = 0xff
-	}
-	if prefixLen%8 != 0 {
-		maskAddr.Addr[prefixLen/8] = ^byte(0xff >> uint(prefixLen%8))
-	}
-	maskPos := gwPos + syscall.SizeofSockaddrInet4
-	*(*syscall.RawSockaddrInet4)(unsafe.Pointer(&wb[maskPos])) = maskAddr
-
-	if _, err := syscall.Write(g.routeSocket, wb); err != nil {
-		return fmt.Errorf("write route message: %w", err)
-	}
-
-	// Read response
-	buf := make([]byte, os.Getpagesize())
-	n, err := syscall.Read(g.routeSocket, buf)
-	if err != nil {
-		return fmt.Errorf("read route message: %w", err)
-	}
-
-	return g.handleRouteResponse(buf, n, "add")
-}
-
-func (g *GatewayMonitor) deleteRouteSyscall(dest net.IP) error {
-	// Create routing message
-	rtmsg := &syscall.RtMsghdr{
-		Type:    syscall.RTM_DELETE,
-		Version: syscall.RTM_VERSION,
-		Seq:     g.seq,
-		Addrs:   syscall.RTA_DST | syscall.RTA_NETMASK,
-		Pid:     0,
-		Flags:   syscall.RTF_UP | syscall.RTF_HOST | syscall.RTF_GATEWAY | syscall.RTF_STATIC,
-	}
-	g.seq++
-
-	// Calculate total message size: header + destination + netmask
-	msgLen := syscall.SizeofRtMsghdr + syscall.SizeofSockaddrInet4*2
-
-	// Create message buffer
-	wb := make([]byte, msgLen)
-
-	// Copy header
-	rtmsg.Msglen = uint16(msgLen)
-	*(*syscall.RtMsghdr)(unsafe.Pointer(&wb[0])) = *rtmsg
-
-	// Add destination sockaddr
-	destAddr := syscall.RawSockaddrInet4{
-		Len:    syscall.SizeofSockaddrInet4,
-		Family: syscall.AF_INET,
-	}
-	copy(destAddr.Addr[:], dest.To4())
-	destPos := syscall.SizeofRtMsghdr
-	*(*syscall.RawSockaddrInet4)(unsafe.Pointer(&wb[destPos])) = destAddr
-
-	// Add netmask sockaddr (full mask for host route)
-	maskAddr := syscall.RawSockaddrInet4{
-		Len:    syscall.SizeofSockaddrInet4,
-		Family: syscall.AF_INET,
-		Addr:   [4]byte{255, 255, 255, 255}, // /32 netmask
-	}
-	maskPos := destPos + syscall.SizeofSockaddrInet4
-	*(*syscall.RawSockaddrInet4)(unsafe.Pointer(&wb[maskPos])) = maskAddr
-
-	// Create a new route socket for deletion
-	sock, err := syscall.Socket(syscall.AF_ROUTE, syscall.SOCK_RAW, syscall.AF_UNSPEC)
-	if err != nil {
-		return fmt.Errorf("create socket: %w", err)
-	}
-	defer syscall.Close(sock)
-
-	// Set socket options
-	err = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_USELOOPBACK, 1)
-	if err != nil {
-		return fmt.Errorf("set socket options: %w", err)
-	}
-
-	// Write the delete message
-	if _, err := syscall.Write(sock, wb); err != nil {
-		return fmt.Errorf("write route message: %w", err)
-	}
-
-	// Read response
-	rb := make([]byte, os.Getpagesize())
-	n, err := syscall.Read(sock, rb)
-	if err != nil {
-		return fmt.Errorf("read route message: %w", err)
-	}
-
-	if n < syscall.SizeofRtMsghdr {
-		return fmt.Errorf("short read: got %d bytes", n)
-	}
-
-	// Parse response header
-	rtm := (*syscall.RtMsghdr)(unsafe.Pointer(&rb[0]))
-	if rtm.Version != syscall.RTM_VERSION {
-		return fmt.Errorf("invalid routing message version: %d", rtm.Version)
-	}
-
-	// Check for errors
-	if rtm.Type == rtmError {
-		errno := *(*int32)(unsafe.Pointer(&rb[syscall.SizeofRtMsghdr]))
-		if errno != 0 {
-			if errno == int32(syscall.ESRCH) {
-				// Route not found is not an error
-				return nil
+		
+		if ipnet.IP.To4() != nil {
+			// IPv4 address
+			ic.ipv4, _ = netip.AddrFromSlice(ipnet.IP)
+			ic.logger.Info("Found IPv4 address for interface", 
+				slog.String("interface", ic.ifname),
+				slog.String("ipv4", ic.ipv4.String()))
+		} else {
+			// IPv6 address - skip link-local addresses
+			if !ipnet.IP.IsLinkLocalUnicast() {
+				ic.ipv6, _ = netip.AddrFromSlice(ipnet.IP)
+				ic.logger.Info("Found IPv6 address for interface", 
+					slog.String("interface", ic.ifname),
+					slog.String("ipv6", ic.ipv6.String()))
 			}
-			return fmt.Errorf("route delete failed: %w", syscall.Errno(errno))
 		}
 	}
-
-	g.logger.Info("Successfully deleted route using syscall",
-		slog.String("destination", dest.String()))
-	return nil
-}
-
-func (g *GatewayMonitor) handleRouteResponse(buf []byte, n int, op string) error {
-	if n < syscall.SizeofRtMsghdr {
-		return fmt.Errorf("short read: got %d bytes", n)
-	}
-
-	rtm := (*syscall.RtMsghdr)(unsafe.Pointer(&buf[0]))
-	if rtm.Version != syscall.RTM_VERSION {
-		return fmt.Errorf("invalid routing message version: %d", rtm.Version)
-	}
-
-	// Check for errors first
-	if rtm.Type == rtmError {
-		errno := *(*int32)(unsafe.Pointer(&buf[syscall.SizeofRtMsghdr]))
-		if errno != 0 {
-			return fmt.Errorf("route %s failed: %w", op, syscall.Errno(errno))
-		}
-	}
-
-	// Check message length after error check
-	msgLen := int(rtm.Msglen)
-	if msgLen > n {
-		return fmt.Errorf("message length %d > read length %d", msgLen, n)
-	}
-
-	return nil
-}
-
-func (g *GatewayMonitor) verifyRoutesSyscall(gatewayIP net.IP) (map[string]bool, error) {
-	g.logger.Info("Verifying routes")
 	
-	msgs, err := g.getRouteTable()
-	if err != nil {
-		return nil, err
+	if ic.ipv4 == (netip.Addr{}) && ic.ipv6 == (netip.Addr{}) {
+		return fmt.Errorf("no valid IP addresses found for interface %s", ic.ifname)
 	}
-
-	routes := make(map[string]bool)
-	for _, rm := range msgs {
-		addr := rm.Addrs[syscall.RTAX_GATEWAY]
-		switch sa := addr.(type) {
-		case *route.Inet4Addr:
-			ip := net.IPv4(sa.IP[0], sa.IP[1], sa.IP[2], sa.IP[3])
-			if ip.Equal(gatewayIP) {
-				routes[ip.String()] = true
-			}
-		case *route.Inet6Addr:
-			ip := make(net.IP, net.IPv6len)
-			copy(ip, sa.IP[:])
-			if ip.Equal(gatewayIP) {
-				routes[ip.String()] = true
-			}
-		}
-	}
-
-	return routes, nil
-}
-
-// updateRoutes updates all client routes with the new gateway
-func (g *GatewayMonitor) updateRoutes(gatewayIP net.IP) error {
-	if gatewayIP == nil {
-		return ErrInvalidGateway
-	}
-
-	g.logger.Info("Updating gateway routes", slog.String("gateway", gatewayIP.String()))
-
-	for _, client := range g.cfg.Clients {
-		clientAddr := client.ProxyEndpointAddress.IP()
-		clientIP := net.IP(clientAddr.AsSlice())
-
-		// First try to delete any existing route
-		err := g.deleteRouteSyscall(clientIP)
-		if err != nil {
-			g.logger.Debug("Route deletion failed (may not exist)",
-				slog.String("client", clientAddr.String()),
-				tslog.Err(err))
-		}
-
-		// Add the new route
-		err = g.addRoute(clientIP, gatewayIP, 32)
-		if err != nil {
-			return fmt.Errorf("add route for client %s: %w", clientIP, err)
-		}
-	}
-
+	
 	return nil
 }
 
-func (g *GatewayMonitor) cleanup() {
-	g.logger.Info("Cleaning up gateway routes")
-
-	// Get current routes first
-	routes, err := g.verifyRoutesSyscall(g.ip)
-	if err != nil {
-		g.logger.Warn("Failed to get current routes during cleanup", tslog.Err(err))
+// GetSourceControlMessage returns a control message for the en0 interface
+func (ic *InterfaceConfig) GetSourceControlMessage(destIP net.IP) []byte {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	
+	var cmsg []byte
+	
+	if destIP.To4() != nil && ic.ipv4 != (netip.Addr{}) {
+		// IPv4
+		cmsg = make([]byte, unix.CmsgSpace(unix.SizeofInet4Pktinfo))
+		cmsgHdr := (*unix.Cmsghdr)(unsafe.Pointer(&cmsg[0]))
+		cmsgHdr.Level = unix.IPPROTO_IP
+		cmsgHdr.Type = unix.IP_PKTINFO
+		cmsgHdr.Len = unix.CmsgLen(unix.SizeofInet4Pktinfo)
+		
+		pktInfo := (*unix.Inet4Pktinfo)(unsafe.Pointer(&cmsg[unix.CmsgLen(0)]))
+		copy(pktInfo.Spec_dst[:], ic.ipv4.AsSlice())
+		pktInfo.Ifindex = ic.ifindex
+	} else if ic.ipv6 != (netip.Addr{}) {
+		// IPv6
+		cmsg = make([]byte, unix.CmsgSpace(unix.SizeofInet6Pktinfo))
+		cmsgHdr := (*unix.Cmsghdr)(unsafe.Pointer(&cmsg[0]))
+		cmsgHdr.Level = unix.IPPROTO_IPV6
+		cmsgHdr.Type = unix.IPV6_PKTINFO
+		cmsgHdr.Len = unix.CmsgLen(unix.SizeofInet6Pktinfo)
+		
+		pktInfo := (*unix.Inet6Pktinfo)(unsafe.Pointer(&cmsg[unix.CmsgLen(0)]))
+		copy(pktInfo.Addr[:], ic.ipv6.AsSlice())
+		pktInfo.Ifindex = ic.ifindex
 	}
-
-	maxRetries := 3
-	for retry := 0; retry < maxRetries; retry++ {
-		allDeleted := true
-
-		for _, client := range g.cfg.Clients {
-			clientAddr := client.ProxyEndpointAddress.IP()
-			clientIP := net.IP(clientAddr.AsSlice())
-
-			// Check if route exists
-			if routes != nil {
-				if _, exists := routes[clientIP.String()]; !exists {
-					continue // Route doesn't exist, skip
-				}
-			}
-
-			if err := g.deleteRouteSyscall(clientIP); err != nil {
-				// Only log as error if it's not "no such route"
-				if !strings.Contains(err.Error(), "no such process") {
-					g.logger.Error("Failed to delete route",
-						slog.String("client", clientAddr.String()),
-						tslog.Err(err))
-					allDeleted = false
-				}
-			} else {
-				g.logger.Info("Successfully deleted route",
-					slog.String("client", clientAddr.String()))
-			}
-		}
-
-		if allDeleted {
-			g.logger.Info("All routes deleted successfully")
-			return
-		}
-
-		// If not all routes were deleted, wait a bit and verify routes again
-		time.Sleep(100 * time.Millisecond)
-		routes, err = g.verifyRoutesSyscall(g.ip)
-		if err != nil {
-			g.logger.Warn("Failed to verify routes during cleanup retry",
-				slog.Int("retry", retry+1),
-				tslog.Err(err))
-		}
-	}
-
-	g.logger.Warn("Some routes may not have been deleted after all retries")
+	
+	return cmsg
 }
 
-// Start begins monitoring the gateway
-func (g *GatewayMonitor) Start() error {
-	gatewayIP, err := g.discoverGateway()
-	if err != nil {
-		return fmt.Errorf("initial gateway discovery: %w", err)
-	}
-
-	if err := g.updateRoutes(gatewayIP); err != nil {
-		return fmt.Errorf("initial route update: %w", err)
-	}
-
-	g.mu.Lock()
-	g.ip = gatewayIP
-	g.mu.Unlock()
-
-	go g.watch()
-	return nil
-}
-
-// Stop halts the gateway monitoring and cleans up routes
-func (g *GatewayMonitor) Stop() {
-	g.cancel()
-	g.cleanup()
-	syscall.Close(g.routeSocket)
-}
-
-func (g *GatewayMonitor) watch() {
-	ticker := time.NewTicker(g.interval)
-	defer ticker.Stop()
-
-	var lastValidGateway net.IP
-	var consecutiveErrors int
-
-	for {
-		select {
-		case <-g.ctx.Done():
-			return
-		case <-ticker.C:
-			ip, err := g.discoverGateway()
-			if err != nil {
-				consecutiveErrors++
-				if consecutiveErrors > 3 {
-					g.logger.Error("Failed to get gateway address", tslog.Err(err))
-				} else {
-					g.logger.Debug("Temporary error getting gateway", tslog.Err(err))
-				}
-
-				// If we have a last valid gateway, keep using it
-				if lastValidGateway != nil {
-					ip = lastValidGateway
-				} else {
-					continue
-				}
-			} else {
-				consecutiveErrors = 0
-			}
-
-			g.mu.Lock()
-			gatewayChanged := !ip.Equal(g.ip)
-			if gatewayChanged {
-				g.logger.Info("Gateway IP changed",
-					slog.String("old", g.ip.String()),
-					slog.String("new", ip.String()))
-
-				// Delete old routes before updating the gateway IP
-				g.logger.Info("Cleaning up old routes")
-				g.cleanup()
-
-				// Update gateway IP
-				g.ip = ip
-				lastValidGateway = ip
-
-				// Add new routes
-				if err := g.updateRoutes(ip); err != nil {
-					g.logger.Error("Failed to update routes", tslog.Err(err))
+// Start periodically updates the interface information to keep it current
+func (ic *InterfaceConfig) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := ic.updateInterfaceInfo(); err != nil {
+					ic.logger.Warn("Failed to update interface info", tslog.Err(err))
 				}
 			}
-			g.mu.Unlock()
 		}
-	}
+	}()
 }
 
-var monitor *GatewayMonitor
+var ifConfig *InterfaceConfig
+var initOnce sync.Once
 
-// Initialize sets up the gateway monitor
+// GetSourceRoutingControlMessage returns the control message for routing
+func GetSourceRoutingControlMessage(destIP net.IP) []byte {
+	if ifConfig == nil {
+		return nil
+	}
+	return ifConfig.GetSourceControlMessage(destIP)
+}
+
+// initHook performs necessary initialization
 func initHook(cfg *service.Config, logger *tslog.Logger) {
-	var err error
-	monitor, err = NewGatewayMonitor(cfg, logger, 10*time.Second)
-	if err != nil {
-		panic(err)
-	}
-
-	if err := monitor.Start(); err != nil {
-		panic(err)
-	}
+	initOnce.Do(func() {
+		var err error
+		
+		// Create the interface configuration for en0
+		ifConfig, err = NewInterfaceConfig("en0", logger)
+		if err != nil {
+			logger.Error("Failed to create interface config", tslog.Err(err))
+			return
+		}
+		
+		// Perform an initial update to ensure we have valid interface data
+		if err := ifConfig.updateInterfaceInfo(); err != nil {
+			logger.Warn("Initial interface update failed, will retry in background", tslog.Err(err))
+		}
+		
+		ctx, cancel := context.WithCancel(context.Background())
+		service.RegisterCleanupHandler(func() {
+			cancel()
+		})
+		
+		// Start the periodic updates
+		ifConfig.Start(ctx)
+		
+		// Create a wrapper function that uses our ifConfig to generate the control message
+		sourceRoutingFunc := func(destIP []byte) []byte {
+			return ifConfig.GetSourceControlMessage(destIP)
+		}
+		
+		// Register the control message function with the service package
+		service.SetSourceRoutingControlMessageFunc(sourceRoutingFunc)
+		
+		logger.Info("Source routing using interface configured", 
+			slog.String("interface", "en0"),
+			slog.Uint32("ifindex", ifConfig.ifindex),
+			slog.String("ipv4", ifConfig.ipv4.String()),
+			slog.String("ipv6", ifConfig.ipv6.String()))
+	})
 }
 
-// Cleanup performs necessary cleanup
+// cleanupHook performs necessary cleanup
 func cleanupHook() {
-	if monitor != nil {
-		monitor.Stop()
-	}
+	// Nothing to do here, the cleanup is handled by the context cancellation
 }
